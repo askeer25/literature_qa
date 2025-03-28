@@ -231,6 +231,8 @@ Based on the provided academic context, please respond to the query with precise
 4. Note limitations or future work discussed
 5. Organize your response in a logical structure
 
+NOTE: 使用中文回答！
+
 If the context doesn't contain sufficient information to answer the query, clearly state what information is missing.
 If information appears contradictory or unclear, acknowledge this and provide the most reasonable interpretation.
 
@@ -366,10 +368,111 @@ class ScholarRAG:
         response = self.response_generator.generate_response(query_str, retrieved_nodes)
         return response
     
-    def query_paper(self, paper_title: str) -> str:
-        """针对特定论文进行查询"""
-        query = f"提供一个关于论文《{paper_title}》的综合摘要和分析"
-        logger.info(f"查询特定论文: {paper_title}")
+    def query_paper(self, query: str) -> str:
+        """根据用户查询针对特定论文进行检索和回答生成
+        
+        如果用户查询意图是针对特定论文，则只检索该论文的内容；
+        否则进行正常的向量检索
+        """
+        # 判断是否是查询特定论文的意图
+        import re
+        
+        # 识别查询中是否包含明确的论文标题
+        paper_title_patterns = [
+            r'《(.+?)》',  # 中文引号
+            r'"(.+?)"',    # 英文双引号
+            r"'(.+?)'",    # 英文单引号 (修复：使用标准直引号替代弯引号)
+        ]
+        
+        paper_title = None
+        for pattern in paper_title_patterns:
+            match = re.search(pattern, query)
+            if match:
+                paper_title = match.group(1)
+                logger.info(f"从查询中识别出论文标题: {paper_title}")
+                break
+        
+        # 如果没有从引号中识别出标题，尝试从关键词模式中识别
+        if not paper_title:
+            paper_keywords = ["论文", "paper", "文章", "article", "publication"]
+            has_paper_keyword = any(keyword in query for keyword in paper_keywords)
+            
+            if has_paper_keyword:
+                # 从系统中获取所有已处理的论文文件路径
+                paper_file_paths = list(self.vector_store.processed_files)
+                
+                # 从文件路径中提取论文标题
+                paper_titles = []
+                for file_path in paper_file_paths:
+                    if os.path.isfile(file_path) and file_path.lower().endswith((".pdf", ".md", ".txt")):
+                        file_name = os.path.basename(file_path)
+                        # 移除扩展名和可能的前缀路径
+                        title = os.path.splitext(file_name)[0]
+                        paper_titles.append((title, file_path))
+                
+                # 计算查询与每个论文标题的相似度
+                if paper_titles:
+                    best_match = None
+                    best_score = -1
+                    
+                    # 使用嵌入模型计算相似度
+                    query_embedding = self.embedding_service.get_query_embedding(query)
+                    
+                    for title, file_path in paper_titles:
+                        title_embedding = self.embedding_service.get_query_embedding(title)
+                        
+                        # 计算余弦相似度
+                        import numpy as np
+                        similarity = np.dot(query_embedding, title_embedding) / (
+                            np.linalg.norm(query_embedding) * np.linalg.norm(title_embedding)
+                        )
+                        
+                        if similarity > best_score:
+                            best_score = similarity
+                            best_match = (title, file_path)
+                    
+                    # 如果最佳匹配相似度超过阈值，认为用户意图是查询该论文
+                    if best_match and best_score > 0.6:
+                        paper_title = best_match[0]
+                        logger.info(f"从查询中匹配到最相关论文: {paper_title}, 相似度: {best_score}")
+        
+        if paper_title:
+            # 针对特定论文进行检索
+            logger.info(f"针对特定论文进行查询: {paper_title}")
+            
+            # 构建过滤器函数来只检索特定论文的内容
+            def filter_nodes_by_paper(nodes: List[NodeWithScore]) -> List[NodeWithScore]:
+                filtered_nodes = []
+                for node in nodes:
+                    # 检查节点元数据中的文件名或路径是否包含论文标题
+                    metadata = node.node.metadata
+                    if "file_name" in metadata and paper_title.lower() in metadata["file_name"].lower():
+                        filtered_nodes.append(node)
+                    elif "file_path" in metadata and paper_title.lower() in metadata["file_path"].lower():
+                        filtered_nodes.append(node)
+                return filtered_nodes
+            
+            # 先进行较大范围的检索，然后过滤
+            retrieved_nodes = self.retrieve(query, top_k=20)
+            filtered_nodes = filter_nodes_by_paper(retrieved_nodes)
+            
+            # 如果过滤后没有结果，使用更宽泛的检索策略
+            if not filtered_nodes:
+                logger.warning(f"未找到与论文《{paper_title}》相关的内容，尝试更宽泛的检索")
+                paper_query = f"关于论文《{paper_title}》的内容"
+                retrieved_nodes = self.retrieve(paper_query, top_k=15)
+                filtered_nodes = filter_nodes_by_paper(retrieved_nodes)
+            
+            # 生成特定论文的回答
+            if filtered_nodes:
+                logger.info(f"为论文《{paper_title}》找到 {len(filtered_nodes)} 个相关节点")
+                response = self.response_generator.generate_response(query, filtered_nodes)
+                return response
+            else:
+                return f"很抱歉，未能在知识库中找到与论文《{paper_title}》相关的内容。"
+        
+        # 如果不是查询特定论文的意图，进行常规检索和回答生成
+        logger.info("进行常规查询检索")
         return self.generate_response(query, top_k=8)
 
 
@@ -398,12 +501,7 @@ if __name__ == "__main__":
 
     # 测试用例2: 针对特定论文进行查询分析
     print("\n--- 测试用例2: 特定论文分析 ---")
-    response2 = rag.query_paper("Highly accurate protein structure prediction with AlphaFold")
+    response2 = rag.query_paper("\"Highly accurate protein structure prediction with AlphaFold\"这篇论文的核心创新点是什么？")
     print(response2)
-
-    # 测试用例3: 比较不同方法的优缺点
-    print("\n--- 测试用例3: 方法比较 ---")
-    response3 = rag.generate_response("比较AlphaFold和HelixFold在蛋白质结构预测方面的性能差异", top_k=6)
-    print(response3)
 
 
